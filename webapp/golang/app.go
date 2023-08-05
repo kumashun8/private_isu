@@ -2,18 +2,22 @@ package main
 
 import (
 	crand "crypto/rand"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path"
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
@@ -26,6 +30,7 @@ import (
 
 var (
 	db    *sqlx.DB
+	mc    *memcache.Client
 	store *gsm.MemcacheStore
 )
 
@@ -53,7 +58,7 @@ type Post struct {
 	CreatedAt    time.Time `db:"created_at"`
 	CommentCount int
 	Comments     []Comment
-	User         User
+	User         User `db:"user"`
 	CSRFToken    string
 }
 
@@ -172,12 +177,34 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 }
 
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
+	// userIDs := make([]int, 0, len(results))
+	// for _, p := range results {
+	// 	userIDs = append(userIDs, p.UserID)
+	// }
+	// users := preloeadUsers(userIDs)
+
 	var posts []Post
 
 	for _, p := range results {
-		err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
-		if err != nil {
+		key := fmt.Sprintf("coments.%d.count", p.ID)
+		val, err := mc.Get(key)
+		if err != nil && err != memcache.ErrCacheMiss {
 			return nil, err
+		}
+		if err == memcache.ErrCacheMiss {
+			// キャッシュが存在しない場合はデータベースから取得する
+			err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+			if err != nil {
+				return nil, err
+			}
+			// 10秒でexpireするようにSetする
+			err = mc.Set(&memcache.Item{Key: key, Value: []byte(strconv.Itoa(p.CommentCount)), Expiration: 10})
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			// キャッシュが存在する場合はキャッシュから取得する
+			p.CommentCount, _ = strconv.Atoi(string(val.Value))
 		}
 
 		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
@@ -204,22 +231,76 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 
 		p.Comments = comments
 
-		err = db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
-			return nil, err
-		}
+		// キャッシュから取得
+		// p.User = getUser(p.UserID)
+		// プリロードから取得
+		// p.User = users[p.UserID]
 
 		p.CSRFToken = csrfToken
 
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
-		}
-		if len(posts) >= postsPerPage {
-			break
-		}
+		posts = append(posts, p)
 	}
 
 	return posts, nil
+}
+
+// データベースからユーザーを一括取得する
+func preloeadUsers(ids []int) map[int]User {
+	users := map[int]User{}
+	if len(ids) == 0 {
+		return users
+	}
+	params := make([]interface{}, 0, len(ids))
+	placeholders := make([]string, 0, len(ids))
+	for _, id := range ids {
+		params = append(params, id)
+		placeholders = append(placeholders, "?")
+	}
+
+	// IN句を利用してデータベースからユーザー情報を取得する
+	// プレースホルダーのリストは','で連結してクエリを生成する
+	query, params, err := sqlx.In("SELECT * FROM `users` WHERE `id` IN (?)", ids)
+	if err != nil {
+		log.Fatal(err)
+	}
+	us := []User{}
+	err = db.Select(&us, query, params...)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, u := range us {
+		users[u.ID] = u
+	}
+	return users
+}
+
+func getUser(id int) User {
+	user := User{}
+	// memcachedから取得
+	it, err := mc.Get(fmt.Sprintf("user_id:%d", id))
+	if err == nil {
+		// memcachedにあった
+		err := json.Unmarshal(it.Value, &user)
+		if err == nil {
+			return user
+		}
+	}
+	// DBから取得
+	err = db.Get(&user, "SELECT * FROM `users` WHERE `id` = ?", id)
+	if err != nil {
+		log.Fatal(err)
+	}
+	j, err := json.Marshal(user)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// memcachedに保存
+	mc.Set(&memcache.Item{
+		Key:        fmt.Sprintf("user_id:%d", id),
+		Value:      j,
+		Expiration: 3600,
+	})
+	return user
 }
 
 func imageURL(p Post) string {
@@ -386,7 +467,13 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC")
+	query := "SELECT p.id AS id, p.user_id AS user_id, p.body AS body, " +
+		"p.created_at AS created_at, p.mime AS mime, " +
+		"u.account_name AS `user.account_name` " +
+		"FROM `posts` AS p FORCE INDEX (`posts_order_idx`) JOIN `users` AS u ON (p.user_id=u.id) " +
+		"WHERE u.del_flg = 0 " +
+		"ORDER BY p.created_at DESC LIMIT " + strconv.Itoa(postsPerPage)
+	err := db.Select(&results, query)
 	if err != nil {
 		log.Print(err)
 		return
@@ -432,7 +519,13 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
+	query := "SELECT p.id AS id, p.user_id AS user_id, p.body AS body, " +
+		"p.created_at AS created_at, p.mime AS mime, " +
+		"u.account_name AS `user.account_name` " +
+		"FROM `posts` AS p FORCE INDEX (`posts_order_idx`) JOIN `users` AS u ON (p.user_id=u.id) " +
+		"WHERE p.user_id = ? AND u.del_flg = 0 " +
+		"ORDER BY p.created_at DESC LIMIT " + strconv.Itoa(postsPerPage)
+	err = db.Select(&results, query, user.ID)
 	if err != nil {
 		log.Print(err)
 		return
@@ -520,7 +613,15 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC", t.Format(ISO8601Format))
+	query := "SELECT p.id AS id, p.user_id AS user_id, p.body AS body, " +
+		"p.created_at AS created_at, p.mime AS mime, " +
+		"u.account_name AS `user.account_name` " +
+
+		"FROM `posts` AS p FORCE INDEX (`posts_order_idx`) JOIN `users` AS u ON (p.user_id=u.id) " +
+		"WHERE p.created_at <= ? AND u.del_flg = 0 " +
+		"ORDER BY p.created_at DESC LIMIT " + strconv.Itoa(postsPerPage)
+	err = db.Select(&results, query, t.Format(ISO8601Format))
+
 	if err != nil {
 		log.Print(err)
 		return
@@ -556,7 +657,15 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.Select(&results, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+
+	query := "SELECT p.id AS id, p.user_id AS user_id, p.body AS body, " +
+		"p.created_at AS created_at, p.mime AS mime, " +
+		"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, " +
+		"u.authority AS `user.authority`, u.del_flg AS `user.del_flg` " +
+		"FROM `posts` AS p FORCE INDEX (`posts_order_idx`) JOIN `users` AS u ON (p.user_id=u.id) " +
+		"WHERE p.id = ? AND u.del_flg = 0 " +
+		"ORDER BY p.created_at DESC LIMIT " + strconv.Itoa(postsPerPage)
+	err = db.Select(&results, query, pid)
 	if err != nil {
 		log.Print(err)
 		return
@@ -815,7 +924,7 @@ func main() {
 	}
 
 	dsn := fmt.Sprintf(
-		"%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=true&loc=Local",
+		"%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=true&loc=Local&interpolateParams=true",
 		user,
 		password,
 		host,
@@ -828,6 +937,8 @@ func main() {
 		log.Fatalf("Failed to connect to DB: %s.", err.Error())
 	}
 	defer db.Close()
+
+	mc = memcache.New("127.0.0.1:11211")
 
 	r := chi.NewRouter()
 
@@ -850,5 +961,26 @@ func main() {
 		http.FileServer(http.Dir("../public")).ServeHTTP(w, r)
 	})
 
-	log.Fatal(http.ListenAndServe(":8080", r))
+	listener, err := net.Listen("unix", "/tmp/webapp.sock")
+	if err != nil {
+		log.Fatalf("Failed to listen on /tmp/webapp.sock: %s.", err.Error())
+	}
+	os.Chmod("/tmp/webapp.sock", 0777)
+	defer func() {
+		err := listener.Close()
+		if err != nil {
+			log.Fatalf("Failed to close listener: %s.", err.Error())
+		}
+	}()
+
+	c := make(chan os.Signal, 2)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c
+		err := listener.Close()
+		if err != nil {
+			log.Fatalf("Failed to close listener: %s.", err.Error())
+		}
+	}()
+	log.Fatal(http.Serve(listener, r))
 }
