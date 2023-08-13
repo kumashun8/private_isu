@@ -181,8 +181,8 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 	cacheKeys := make([]string, 0, len(results)*2)
 	for _, p := range results {
 		cacheKeys = append(cacheKeys,
-			fmt.Sprintf("coments.%d.count", p.ID),
-			fmt.Sprintf("coments.%d.%t", p.ID, allComments),
+			fmt.Sprintf("comments.%d.count", p.ID),
+			fmt.Sprintf("comments.%d.%t", p.ID, allComments),
 		)
 	}
 	cachedValues, err := mc.GetMulti(cacheKeys)
@@ -191,7 +191,7 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 	}
 
 	for _, p := range results {
-		key := fmt.Sprintf("coments.%d.count", p.ID)
+		key := fmt.Sprintf("comments.%d.count", p.ID)
 		if cachedValues[key] == nil {
 			// キャッシュが存在しない場合はデータベースから取得する
 			err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
