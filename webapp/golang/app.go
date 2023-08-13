@@ -178,13 +178,21 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 
 	var posts []Post
 
+	cacheKeys := make([]string, 0, len(results)*2)
+	for _, p := range results {
+		cacheKeys = append(cacheKeys,
+			fmt.Sprintf("coments.%d.count", p.ID),
+			fmt.Sprintf("coments.%d.%t", p.ID, allComments),
+		)
+	}
+	cachedValues, err := mc.GetMulti(cacheKeys)
+	if err != nil && err != memcache.ErrCacheMiss {
+		return nil, err
+	}
+
 	for _, p := range results {
 		key := fmt.Sprintf("coments.%d.count", p.ID)
-		val, err := mc.Get(key)
-		if err != nil && err != memcache.ErrCacheMiss {
-			return nil, err
-		}
-		if err == memcache.ErrCacheMiss {
+		if cachedValues[key] == nil {
 			// キャッシュが存在しない場合はデータベースから取得する
 			err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
 			if err != nil {
@@ -197,16 +205,12 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 			}
 		} else {
 			// キャッシュが存在する場合はキャッシュから取得する
-			p.CommentCount, _ = strconv.Atoi(string(val.Value))
+			p.CommentCount, _ = strconv.Atoi(string(cachedValues[key].Value))
 		}
 
 		var comments []Comment
 		key = fmt.Sprintf("comments.%d.%t", p.ID, allComments)
-		cacheComments, err := mc.Get(key)
-		if err != nil && err != memcache.ErrCacheMiss {
-			return nil, err
-		}
-		if err == memcache.ErrCacheMiss {
+		if cachedValues[key] == nil {
 			// キャッシュが存在しない場合はデータベースから取得する
 			query := "SELECT c.`comment` AS `comment`, c.`created_at` AS `created_at`, " +
 				"u.`account_name` AS `user.account_name`" +
@@ -230,7 +234,7 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 			}
 		} else {
 			// キャッシュが存在する場合はキャッシュから取得する
-			err := json.Unmarshal(cacheComments.Value, &comments)
+			err := json.Unmarshal(cachedValues[key].Value, &comments)
 			if err != nil {
 				return nil, err
 			}
