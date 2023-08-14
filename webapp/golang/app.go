@@ -793,6 +793,9 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	imgFile := "../public/img" + fmt.Sprintf("/%d.%s", pid, strings.Split(mime, "/")[1])
+	os.WriteFile(imgFile, filedata, 0644)
+
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
 
@@ -824,6 +827,15 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+
+	imgFile := "../public/img" + fmt.Sprintf("/%d.%s", post.ID, ext)
+	f, err := os.Open(imgFile)
+	defer f.Close()
+	if err != nil {
+		log.Print(err)
+		return
+	}
+	f.Write(post.Imgdata)
 
 	w.WriteHeader(http.StatusNotFound)
 }
