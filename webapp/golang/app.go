@@ -679,7 +679,7 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 		"p.created_at AS created_at, p.mime AS mime, " +
 		"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, " +
 		"u.authority AS `user.authority`, u.del_flg AS `user.del_flg` " +
-		"FROM `posts` AS p FORCE INDEX (`posts_order_idx`) JOIN `users` AS u ON (p.user_id=u.id) " +
+		"FROM `posts` AS p JOIN `users` AS u ON (p.user_id=u.id) " +
 		"WHERE p.id = ? AND u.del_flg = 0 " +
 		"ORDER BY p.created_at DESC LIMIT " + strconv.Itoa(postsPerPage)
 	err = db.Select(&results, query, pid)
