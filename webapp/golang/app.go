@@ -3,6 +3,7 @@ package main
 import (
 	crand "crypto/rand"
 	"crypto/sha512"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -29,16 +30,16 @@ import (
 )
 
 var (
-	db    *sqlx.DB
-	mc    *memcache.Client
-	store *gsm.MemcacheStore
+	db             *sqlx.DB
+	store          *gsm.MemcacheStore
+	memcacheClient *memcache.Client
 )
 
 const (
-	postsPerPage  = 20
-	ISO8601Format = "2006-01-02T15:04:05-07:00"
-	UploadLimit   = 10 * 1024 * 1024 // 10mb
-	imageDir      = "/home/isucon/private_isu/webapp/public/image"
+	postsPerPage         = 20
+	ISO8601Format        = "2006-01-02T15:04:05-07:00"
+	UploadLimit          = 10 * 1024 * 1024 // 10mb
+	ImageDir      string = "/home/isucon/private_isu/webapp/public/image"
 )
 
 type User struct {
@@ -59,17 +60,17 @@ type Post struct {
 	CreatedAt    time.Time `db:"created_at"`
 	CommentCount int
 	Comments     []Comment
-	User         User `db:"user"`
+	User         User
 	CSRFToken    string
 }
 
 type Comment struct {
-	ID        int       `db:"id"`
-	PostID    int       `db:"post_id"`
-	UserID    int       `db:"user_id"`
-	Comment   string    `db:"comment"`
-	CreatedAt time.Time `db:"created_at"`
-	User      User      `db:"user"`
+	ID        int       `db:"id" json:"id"`
+	PostID    int       `db:"post_id" json:"post_id"`
+	UserID    int       `db:"user_id" json:"user_id"`
+	Comment   string    `db:"comment" json:"comment"`
+	CreatedAt time.Time `db:"created_at" json:"created_at"`
+	User      User
 }
 
 func init() {
@@ -77,7 +78,7 @@ func init() {
 	if memdAddr == "" {
 		memdAddr = "localhost:11211"
 	}
-	memcacheClient := memcache.New(memdAddr)
+	memcacheClient = memcache.New(memdAddr)
 	store = gsm.NewMemcacheStore(memcacheClient, "iscogram_", []byte("sendagaya"))
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 }
@@ -115,15 +116,9 @@ func validateUser(accountName, password string) bool {
 		regexp.MustCompile(`\A[0-9a-zA-Z_]{6,}\z`).MatchString(password)
 }
 
-// 今回のGo実装では言語側のエスケープの仕組みが使えないのでOSコマンドインジェクション対策できない
-// 取り急ぎPHPのescapeshellarg関数を参考に自前で実装
-// cf: http://jp2.php.net/manual/ja/function.escapeshellarg.php
-func escapeshellarg(arg string) string {
-	return "'" + strings.Replace(arg, "'", "'\\''", -1) + "'"
-}
-
 func digest(src string) string {
-	return fmt.Sprintf("%x", sha512.Sum512([]byte(src)))
+	s := sha512.Sum512([]byte(src))
+	return strings.TrimSuffix(hex.EncodeToString(s[:]), "\n")
 }
 
 func calculateSalt(accountName string) string {
@@ -171,88 +166,96 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 }
 
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
-	// userIDs := make([]int, 0, len(results))
-	// for _, p := range results {
-	// 	userIDs = append(userIDs, p.UserID)
-	// }
-	// users := preloeadUsers(userIDs)
-
 	var posts []Post
 
-	cacheKeys := make([]string, 0, len(results)*2)
-	for _, p := range results {
-		cacheKeys = append(cacheKeys,
-			fmt.Sprintf("comments.%d.count", p.ID),
-			fmt.Sprintf("comments.%d.%t", p.ID, allComments),
-		)
+	var commentsCountKeys []string
+	var commentsKeys []string
+	var b string
+	if allComments {
+		b = ".true"
+	} else {
+		b = ".false"
 	}
-	cachedValues, err := mc.GetMulti(cacheKeys)
-	if err != nil && err != memcache.ErrCacheMiss {
-		return nil, err
+	for _, p := range results {
+		commentsCountKeys = append(commentsCountKeys, "comments."+strconv.Itoa(p.ID)+".count")
+		commentsKeys = append(commentsKeys, "comments"+strconv.Itoa(p.ID)+b)
 	}
 
+	cachedCommentCounts, err := memcacheClient.GetMulti(commentsCountKeys)
+	cachedComments, err := memcacheClient.GetMulti(commentsKeys)
+
 	for _, p := range results {
-		key := fmt.Sprintf("comments.%d.count", p.ID)
-		if cachedValues[key] == nil {
-			// キャッシュが存在しない場合はデータベースから取得する
+		commentsCountKey := "comments." + strconv.Itoa(p.ID) + ".count"
+		var b string
+		if allComments {
+			b = ".true"
+		} else {
+			b = ".false"
+		}
+		commentsKey := "comments" + strconv.Itoa(p.ID) + b
+
+		// cachedCommentCount, err := memcacheClient.Get(commentsCountKey)
+		cachedCommentCount, ok := cachedCommentCounts[commentsCountKey]
+		if !ok {
+			// キャッシュミスした場合は、DB から値を取得してキャッシュを作成
 			err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
 			if err != nil {
+				log.Print(err)
 				return nil, err
 			}
-			// 10秒でexpireするようにSetする
-			err = mc.Set(&memcache.Item{Key: key, Value: []byte(strconv.Itoa(p.CommentCount)), Expiration: 10})
-			if err != nil {
-				return nil, err
-			}
+			memcacheClient.Set(&memcache.Item{Key: commentsCountKey, Value: []byte(strconv.Itoa(p.CommentCount))})
 		} else {
-			// キャッシュが存在する場合はキャッシュから取得する
-			p.CommentCount, _ = strconv.Atoi(string(cachedValues[key].Value))
+			p.CommentCount, err = strconv.Atoi(string(cachedCommentCount.Value))
+			if err != nil {
+				log.Print(err)
+				return nil, err
+			}
 		}
 
-		var comments []Comment
-		key = fmt.Sprintf("comments.%d.%t", p.ID, allComments)
-		if cachedValues[key] == nil {
-			// キャッシュが存在しない場合はデータベースから取得する
-			query := "SELECT c.`comment` AS `comment`, c.`created_at` AS `created_at`, " +
-				"u.`account_name` AS `user.account_name`" +
-				"FROM `comments` AS c JOIN `users` AS u ON c.`user_id`=u.`id` " +
-				"WHERE c.`post_id` = ? ORDER BY c.`created_at` DESC"
+		// cachedComments, err := memcacheClient.Get(commentsKey)
+		cachedComments, ok := cachedComments[commentsKey]
+		if !ok {
+			// キャッシュミスした場合は、DB から値を取得してキャッシュを作成
+			query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
 			if !allComments {
 				query += " LIMIT 3"
 			}
+			var comments []Comment
 			err = db.Select(&comments, query, p.ID)
 			if err != nil {
+				log.Print(err)
 				return nil, err
 			}
-			// 10秒でexpireするようにSetする
-			commentsJSON, err := json.Marshal(comments)
-			if err != nil {
-				return nil, err
+
+			for i := 0; i < len(comments); i++ {
+				err := db.Get(&comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
+				if err != nil {
+					log.Print(err)
+					return nil, err
+				}
 			}
-			err = mc.Set(&memcache.Item{Key: key, Value: []byte(commentsJSON), Expiration: 10})
-			if err != nil {
-				return nil, err
+
+			// reverse
+			for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
+				comments[i], comments[j] = comments[j], comments[i]
 			}
-		} else {
-			// キャッシュが存在する場合はキャッシュから取得する
-			err := json.Unmarshal(cachedValues[key].Value, &comments)
-			if err != nil {
-				return nil, err
-			}
+
 			p.Comments = comments
+
+			encodedVale, err := json.Marshal(p.Comments)
+			if err != nil {
+				log.Print(err)
+				return nil, err
+			}
+			memcacheClient.Set(&memcache.Item{Key: commentsKey, Value: []byte(encodedVale)})
+		} else {
+			var decodedVale []Comment
+			if err := json.Unmarshal(cachedComments.Value, &decodedVale); err != nil {
+				log.Print(err)
+				return nil, err
+			}
+			p.Comments = decodedVale
 		}
-
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
-		}
-
-		p.Comments = comments
-
-		// キャッシュから取得
-		// p.User = getUser(p.UserID)
-		// プリロードから取得
-		// p.User = users[p.UserID]
 
 		p.CSRFToken = csrfToken
 
@@ -260,65 +263,6 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 	}
 
 	return posts, nil
-}
-
-// データベースからユーザーを一括取得する
-func preloeadUsers(ids []int) map[int]User {
-	users := map[int]User{}
-	if len(ids) == 0 {
-		return users
-	}
-	params := make([]interface{}, 0, len(ids))
-	placeholders := make([]string, 0, len(ids))
-	for _, id := range ids {
-		params = append(params, id)
-		placeholders = append(placeholders, "?")
-	}
-
-	// IN句を利用してデータベースからユーザー情報を取得する
-	// プレースホルダーのリストは','で連結してクエリを生成する
-	query, params, err := sqlx.In("SELECT * FROM `users` WHERE `id` IN (?)", ids)
-	if err != nil {
-		log.Fatal(err)
-	}
-	us := []User{}
-	err = db.Select(&us, query, params...)
-	if err != nil {
-		log.Fatal(err)
-	}
-	for _, u := range us {
-		users[u.ID] = u
-	}
-	return users
-}
-
-func getUser(id int) User {
-	user := User{}
-	// memcachedから取得
-	it, err := mc.Get(fmt.Sprintf("user_id:%d", id))
-	if err == nil {
-		// memcachedにあった
-		err := json.Unmarshal(it.Value, &user)
-		if err == nil {
-			return user
-		}
-	}
-	// DBから取得
-	err = db.Get(&user, "SELECT * FROM `users` WHERE `id` = ?", id)
-	if err != nil {
-		log.Fatal(err)
-	}
-	j, err := json.Marshal(user)
-	if err != nil {
-		log.Fatal(err)
-	}
-	// memcachedに保存
-	mc.Set(&memcache.Item{
-		Key:        fmt.Sprintf("user_id:%d", id),
-		Value:      j,
-		Expiration: 3600,
-	})
-	return user
 }
 
 func imageURL(p Post) string {
@@ -485,13 +429,11 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	query := "SELECT p.id AS id, p.user_id AS user_id, p.body AS body, " +
-		"p.created_at AS created_at, p.mime AS mime, " +
-		"u.account_name AS `user.account_name` " +
-		"FROM `posts` AS p STRAIGHT_JOIN `users` AS u ON (p.user_id=u.id) " +
-		"WHERE u.del_flg = 0 " +
-		"ORDER BY p.created_at DESC LIMIT " + strconv.Itoa(postsPerPage)
-	err := db.Select(&results, query)
+	err := db.Select(&results,
+		"SELECT p.`id`, p.`user_id`, p.`body`, p.`mime`, p.`created_at` FROM `posts` AS p "+
+			"STRAIGHT_JOIN `users` AS u ON p.user_id = u.id "+
+			"WHERE u.`del_flg` = 0 "+
+			"ORDER BY p.`created_at` DESC LIMIT 20")
 	if err != nil {
 		log.Print(err)
 		return
@@ -537,13 +479,13 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	query := "SELECT p.id AS id, p.user_id AS user_id, p.body AS body, " +
-		"p.created_at AS created_at, p.mime AS mime, " +
-		"u.account_name AS `user.account_name` " +
-		"FROM `posts` AS p STRAIGHT_JOIN `users` AS u ON (p.user_id=u.id) " +
-		"WHERE p.user_id = ? AND u.del_flg = 0 " +
-		"ORDER BY p.created_at DESC LIMIT " + strconv.Itoa(postsPerPage)
-	err = db.Select(&results, query, user.ID)
+	err = db.Select(&results,
+		"SELECT p.`id`, p.`user_id`, p.`body`, p.`mime`, p.`created_at` FROM `posts` AS p "+
+			"STRAIGHT_JOIN `users` AS u ON p.user_id = u.id "+
+			"WHERE u.`del_flg` = 0 "+
+			"AND `user_id` = ? "+
+			"ORDER BY p.`created_at` DESC LIMIT 20",
+		user.ID)
 	if err != nil {
 		log.Print(err)
 		return
@@ -631,14 +573,13 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	query := "SELECT p.id AS id, p.user_id AS user_id, p.body AS body, " +
-		"p.created_at AS created_at, p.mime AS mime, " +
-		"u.account_name AS `user.account_name` " +
-		"FROM `posts` AS p STRAIGHT_JOIN `users` AS u ON (p.user_id=u.id) " +
-		"WHERE p.created_at <= ? AND u.del_flg = 0 " +
-		"ORDER BY p.created_at DESC LIMIT " + strconv.Itoa(postsPerPage)
-	err = db.Select(&results, query, t.Format(ISO8601Format))
-
+	err = db.Select(&results,
+		"SELECT p.`id`, p.`user_id`, p.`body`, p.`mime`, p.`created_at` FROM `posts` AS p "+
+			"STRAIGHT_JOIN `users` AS u ON p.user_id = u.id "+
+			"WHERE u.`del_flg` = 0 "+
+			"AND p.`created_at` <= ? "+
+			"ORDER BY p.`created_at` DESC LIMIT 20",
+		t.Format(ISO8601Format))
 	if err != nil {
 		log.Print(err)
 		return
@@ -674,15 +615,7 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-
-	query := "SELECT p.id AS id, p.user_id AS user_id, p.body AS body, " +
-		"p.created_at AS created_at, p.mime AS mime, " +
-		"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, " +
-		"u.authority AS `user.authority`, u.del_flg AS `user.del_flg` " +
-		"FROM `posts` AS p JOIN `users` AS u ON (p.user_id=u.id) " +
-		"WHERE p.id = ? AND u.del_flg = 0 " +
-		"ORDER BY p.created_at DESC LIMIT " + strconv.Itoa(postsPerPage)
-	err = db.Select(&results, query, pid)
+	err = db.Select(&results, "SELECT * FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
 		return
@@ -739,16 +672,17 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mime := ""
+	// mime := ""
+	mime, ext := "", ""
 	if file != nil {
 		// 投稿のContent-Typeからファイルのタイプを決定する
 		contentType := header.Header["Content-Type"][0]
 		if strings.Contains(contentType, "jpeg") {
-			mime = "image/jpeg"
+			mime, ext = "image/jpeg", "jpg"
 		} else if strings.Contains(contentType, "png") {
-			mime = "image/png"
+			mime, ext = "image/png", "png"
 		} else if strings.Contains(contentType, "gif") {
-			mime = "image/gif"
+			mime, ext = "image/gif", "gif"
 		} else {
 			session := getSession(r)
 			session.Values["notice"] = "投稿できる画像形式はjpgとpngとgifだけです"
@@ -779,7 +713,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		query,
 		me.ID,
 		mime,
-		"", //　ローカルファイルとして保存しnginxから配信するのでDBには保存しない
+		"",
 		r.FormValue("body"),
 	)
 	if err != nil {
@@ -793,11 +727,19 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	imgFile := imageDir + fmt.Sprintf("/%d.%s", pid, strings.Split(mime, "/")[1])
-	err = os.WriteFile(imgFile, filedata, 0644)
+	imgFile := ImageDir + "/" + strconv.FormatInt(pid, 10) + "." + ext
+	f, err := os.Create(imgFile)
 	if err != nil {
 		log.Print(err)
+		return
 	}
+	_, err = f.Write(filedata)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+	err = os.Chmod(imgFile, 0644)
+	f.Close()
 
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
@@ -822,25 +764,28 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 	if ext == "jpg" && post.Mime == "image/jpeg" ||
 		ext == "png" && post.Mime == "image/png" ||
 		ext == "gif" && post.Mime == "image/gif" {
-		w.Header().Set("Content-Type", post.Mime)
-		_, err := w.Write(post.Imgdata)
+
+		// 取得されたタイミングでファイルに書き出す
+		imgFile := ImageDir + "/" + pidStr + "." + ext
+		f, err := os.Create(imgFile)
 		if err != nil {
 			log.Print(err)
 			return
 		}
-		return
-	}
+		_, err = f.Write(post.Imgdata)
+		if err != nil {
+			log.Print(err)
+			return
+		}
+		err = os.Chmod(imgFile, 0644)
+		f.Close()
 
-	imgFile := imageDir + fmt.Sprintf("/%d.%s", post.ID, ext)
-	f, err := os.Open(imgFile)
-	defer f.Close()
-	if err != nil {
-		log.Print(err)
-		return
-	}
-	_, err = f.Write(post.Imgdata)
-	if err != nil {
-		log.Print(err)
+		w.Header().Set("Content-Type", post.Mime)
+		_, err = w.Write(post.Imgdata)
+		if err != nil {
+			log.Print(err)
+			return
+		}
 		return
 	}
 
@@ -864,6 +809,11 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 		log.Print("post_idは整数のみです")
 		return
 	}
+
+	// コメントが投稿された投稿のキャッシュをクリアしておく
+	memcacheClient.Delete("comments." + strconv.Itoa(postID) + ".count")
+	memcacheClient.Delete("comments." + strconv.Itoa(postID) + ".true")
+	memcacheClient.Delete("comments." + strconv.Itoa(postID) + ".false")
 
 	query := "INSERT INTO `comments` (`post_id`, `user_id`, `comment`) VALUES (?,?,?)"
 	_, err = db.Exec(query, postID, me.ID, r.FormValue("comment"))
@@ -973,8 +923,6 @@ func main() {
 		log.Fatalf("Failed to connect to DB: %s.", err.Error())
 	}
 	defer db.Close()
-
-	mc = memcache.New("127.0.0.1:11211")
 
 	r := chi.NewRouter()
 
