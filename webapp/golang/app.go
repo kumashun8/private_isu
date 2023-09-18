@@ -38,6 +38,7 @@ const (
 	postsPerPage  = 20
 	ISO8601Format = "2006-01-02T15:04:05-07:00"
 	UploadLimit   = 10 * 1024 * 1024 // 10mb
+	imageDir      = "/home/isucon/private_isu/webapp/public/image"
 )
 
 type User struct {
@@ -487,7 +488,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 	query := "SELECT p.id AS id, p.user_id AS user_id, p.body AS body, " +
 		"p.created_at AS created_at, p.mime AS mime, " +
 		"u.account_name AS `user.account_name` " +
-		"FROM `posts` AS p FORCE INDEX (`posts_order_idx`) JOIN `users` AS u ON (p.user_id=u.id) " +
+		"FROM `posts` AS p STRAIGHT_JOIN `users` AS u ON (p.user_id=u.id) " +
 		"WHERE u.del_flg = 0 " +
 		"ORDER BY p.created_at DESC LIMIT " + strconv.Itoa(postsPerPage)
 	err := db.Select(&results, query)
@@ -539,7 +540,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 	query := "SELECT p.id AS id, p.user_id AS user_id, p.body AS body, " +
 		"p.created_at AS created_at, p.mime AS mime, " +
 		"u.account_name AS `user.account_name` " +
-		"FROM `posts` AS p FORCE INDEX (`posts_order_idx`) JOIN `users` AS u ON (p.user_id=u.id) " +
+		"FROM `posts` AS p STRAIGHT_JOIN `users` AS u ON (p.user_id=u.id) " +
 		"WHERE p.user_id = ? AND u.del_flg = 0 " +
 		"ORDER BY p.created_at DESC LIMIT " + strconv.Itoa(postsPerPage)
 	err = db.Select(&results, query, user.ID)
@@ -633,8 +634,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	query := "SELECT p.id AS id, p.user_id AS user_id, p.body AS body, " +
 		"p.created_at AS created_at, p.mime AS mime, " +
 		"u.account_name AS `user.account_name` " +
-
-		"FROM `posts` AS p FORCE INDEX (`posts_order_idx`) JOIN `users` AS u ON (p.user_id=u.id) " +
+		"FROM `posts` AS p STRAIGHT_JOIN `users` AS u ON (p.user_id=u.id) " +
 		"WHERE p.created_at <= ? AND u.del_flg = 0 " +
 		"ORDER BY p.created_at DESC LIMIT " + strconv.Itoa(postsPerPage)
 	err = db.Select(&results, query, t.Format(ISO8601Format))
@@ -779,7 +779,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		query,
 		me.ID,
 		mime,
-		filedata,
+		"", //　ローカルファイルとして保存しnginxから配信するのでDBには保存しない
 		r.FormValue("body"),
 	)
 	if err != nil {
@@ -793,8 +793,11 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	imgFile := "../public/image" + fmt.Sprintf("/%d.%s", pid, strings.Split(mime, "/")[1])
-	os.WriteFile(imgFile, filedata, 0644)
+	imgFile := imageDir + fmt.Sprintf("/%d.%s", pid, strings.Split(mime, "/")[1])
+	err = os.WriteFile(imgFile, filedata, 0644)
+	if err != nil {
+		log.Print(err)
+	}
 
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
@@ -828,14 +831,18 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	imgFile := "../public/image" + fmt.Sprintf("/%d.%s", post.ID, ext)
+	imgFile := imageDir + fmt.Sprintf("/%d.%s", post.ID, ext)
 	f, err := os.Open(imgFile)
 	defer f.Close()
 	if err != nil {
 		log.Print(err)
 		return
 	}
-	f.Write(post.Imgdata)
+	_, err = f.Write(post.Imgdata)
+	if err != nil {
+		log.Print(err)
+		return
+	}
 
 	w.WriteHeader(http.StatusNotFound)
 }

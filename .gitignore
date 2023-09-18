@@ -17,4 +17,4 @@ portal/tmp
 /portal/tmp
 .vagrant
 
-webapp/public/img/*
+webapp/public/image/*
