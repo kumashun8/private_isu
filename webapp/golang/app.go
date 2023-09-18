@@ -832,7 +832,7 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	imgFile := imageDir + fmt.Sprintf("/%d.%s", post.ID, ext)
-	f, err := os.Create(imgFile)
+	f, err := os.Open(imgFile)
 	defer f.Close()
 	if err != nil {
 		log.Print(err)
