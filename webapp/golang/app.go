@@ -246,36 +246,6 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 	return posts, nil
 }
 
-// データベースからユーザーを一括取得する
-func preloeadUsers(ids []int) map[int]User {
-	users := map[int]User{}
-	if len(ids) == 0 {
-		return users
-	}
-	params := make([]interface{}, 0, len(ids))
-	placeholders := make([]string, 0, len(ids))
-	for _, id := range ids {
-		params = append(params, id)
-		placeholders = append(placeholders, "?")
-	}
-
-	// IN句を利用してデータベースからユーザー情報を取得する
-	// プレースホルダーのリストは','で連結してクエリを生成する
-	query, params, err := sqlx.In("SELECT * FROM `users` WHERE `id` IN (?)", ids)
-	if err != nil {
-		log.Fatal(err)
-	}
-	us := []User{}
-	err = db.Select(&us, query, params...)
-	if err != nil {
-		log.Fatal(err)
-	}
-	for _, u := range us {
-		users[u.ID] = u
-	}
-	return users
-}
-
 func getUser(id int) User {
 	user := User{}
 	// memcachedから取得
