@@ -439,9 +439,8 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	query := "SELECT p.id AS id, p.user_id AS user_id, p.body AS body, " +
-		"p.created_at AS created_at, p.mime AS mime, " +
-		"u.account_name AS `user.account_name` " +
+	query := "SELECT p.id AS id, p.user_id AS user_id, " +
+		"p.body AS body, p.created_at AS created_at, p.mime AS mime " +
 		"FROM `posts` AS p STRAIGHT_JOIN `users` AS u ON (p.user_id=u.id) " +
 		"WHERE u.del_flg = 0 " +
 		"ORDER BY p.created_at DESC LIMIT " + strconv.Itoa(postsPerPage)
@@ -492,8 +491,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 	results := []Post{}
 
 	query := "SELECT p.id AS id, p.user_id AS user_id, p.body AS body, " +
-		"p.created_at AS created_at, p.mime AS mime, " +
-		"u.account_name AS `user.account_name` " +
+		"p.created_at AS created_at, p.mime AS mime " +
 		"FROM `posts` AS p STRAIGHT_JOIN `users` AS u ON (p.user_id=u.id) " +
 		"WHERE p.user_id = ? AND u.del_flg = 0 " +
 		"ORDER BY p.created_at DESC LIMIT " + strconv.Itoa(postsPerPage)
@@ -586,8 +584,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 	query := "SELECT p.id AS id, p.user_id AS user_id, p.body AS body, " +
-		"p.created_at AS created_at, p.mime AS mime, " +
-		"u.account_name AS `user.account_name` " +
+		"p.created_at AS created_at, p.mime AS mime " +
 		"FROM `posts` AS p STRAIGHT_JOIN `users` AS u ON (p.user_id=u.id) " +
 		"WHERE p.created_at <= ? AND u.del_flg = 0 " +
 		"ORDER BY p.created_at DESC LIMIT " + strconv.Itoa(postsPerPage)
@@ -628,8 +625,8 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
+
 	err = db.Select(&results, "SELECT * FROM `posts` WHERE `id` = ?", pid)
-	err = db.Select(&results, query, pid)
 	if err != nil {
 		log.Print(err)
 		return
@@ -726,7 +723,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		query,
 		me.ID,
 		mime,
-		filedata,
+		"",
 		r.FormValue("body"),
 	)
 	if err != nil {
@@ -775,20 +772,11 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 			log.Print(err)
 			return
 		}
-		return
-	}
-
-	imgFile := imageDir + fmt.Sprintf("/%d.%s", post.ID, ext)
-	f, err := os.Open(imgFile)
-	defer f.Close()
-	if err != nil {
-		log.Print(err)
-		return
-	}
-	_, err = f.Write(post.Imgdata)
-	if err != nil {
-		log.Print(err)
-		return
+		imgFile := imageDir + fmt.Sprintf("/%d.%s", pid, ext)
+		err = os.WriteFile(imgFile, post.Imgdata, 0644)
+		if err != nil {
+			log.Print(err)
+		}
 	}
 
 	w.WriteHeader(http.StatusNotFound)
@@ -811,6 +799,10 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 		log.Print("post_idは整数のみです")
 		return
 	}
+
+	mc.Delete("comments." + strconv.Itoa(postID) + ".count")
+	mc.Delete("comments." + strconv.Itoa(postID) + ".true")
+	mc.Delete("comments." + strconv.Itoa(postID) + ".false")
 
 	query := "INSERT INTO `comments` (`post_id`, `user_id`, `comment`) VALUES (?,?,?)"
 	_, err = db.Exec(query, postID, me.ID, r.FormValue("comment"))
