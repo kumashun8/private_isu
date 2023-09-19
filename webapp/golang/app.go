@@ -171,12 +171,6 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 }
 
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
-	// userIDs := make([]int, 0, len(results))
-	// for _, p := range results {
-	// 	userIDs = append(userIDs, p.UserID)
-	// }
-	// users := preloeadUsers(userIDs)
-
 	var posts []Post
 
 	cacheKeys := make([]string, 0, len(results)*2)
@@ -195,7 +189,8 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 		key := fmt.Sprintf("comments.%d.count", p.ID)
 		if cachedValues[key] == nil {
 			// キャッシュが存在しない場合はデータベースから取得する
-			err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+			query := "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?"
+			err := db.Get(&p.CommentCount, query, p.ID)
 			if err != nil {
 				return nil, err
 			}
@@ -213,10 +208,7 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 		key = fmt.Sprintf("comments.%d.%t", p.ID, allComments)
 		if cachedValues[key] == nil {
 			// キャッシュが存在しない場合はデータベースから取得する
-			query := "SELECT c.`comment` AS `comment`, c.`created_at` AS `created_at`, " +
-				"u.`account_name` AS `user.account_name`" +
-				"FROM `comments` AS c JOIN `users` AS u ON c.`user_id`=u.`id` " +
-				"WHERE c.`post_id` = ? ORDER BY c.`created_at` DESC"
+			query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
 			if !allComments {
 				query += " LIMIT 3"
 			}
@@ -233,6 +225,10 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 			if err != nil {
 				return nil, err
 			}
+			// reverse
+			for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
+				comments[i], comments[j] = comments[j], comments[i]
+			}
 		} else {
 			// キャッシュが存在する場合はキャッシュから取得する
 			err := json.Unmarshal(cachedValues[key].Value, &comments)
@@ -242,54 +238,12 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 			p.Comments = comments
 		}
 
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
-		}
-
-		p.Comments = comments
-
-		// キャッシュから取得
-		// p.User = getUser(p.UserID)
-		// プリロードから取得
-		// p.User = users[p.UserID]
-
 		p.CSRFToken = csrfToken
 
 		posts = append(posts, p)
 	}
 
 	return posts, nil
-}
-
-// データベースからユーザーを一括取得する
-func preloeadUsers(ids []int) map[int]User {
-	users := map[int]User{}
-	if len(ids) == 0 {
-		return users
-	}
-	params := make([]interface{}, 0, len(ids))
-	placeholders := make([]string, 0, len(ids))
-	for _, id := range ids {
-		params = append(params, id)
-		placeholders = append(placeholders, "?")
-	}
-
-	// IN句を利用してデータベースからユーザー情報を取得する
-	// プレースホルダーのリストは','で連結してクエリを生成する
-	query, params, err := sqlx.In("SELECT * FROM `users` WHERE `id` IN (?)", ids)
-	if err != nil {
-		log.Fatal(err)
-	}
-	us := []User{}
-	err = db.Select(&us, query, params...)
-	if err != nil {
-		log.Fatal(err)
-	}
-	for _, u := range us {
-		users[u.ID] = u
-	}
-	return users
 }
 
 func getUser(id int) User {
@@ -485,9 +439,8 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	query := "SELECT p.id AS id, p.user_id AS user_id, p.body AS body, " +
-		"p.created_at AS created_at, p.mime AS mime, " +
-		"u.account_name AS `user.account_name` " +
+	query := "SELECT p.id AS id, p.user_id AS user_id, " +
+		"p.body AS body, p.created_at AS created_at, p.mime AS mime " +
 		"FROM `posts` AS p STRAIGHT_JOIN `users` AS u ON (p.user_id=u.id) " +
 		"WHERE u.del_flg = 0 " +
 		"ORDER BY p.created_at DESC LIMIT " + strconv.Itoa(postsPerPage)
@@ -538,8 +491,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 	results := []Post{}
 
 	query := "SELECT p.id AS id, p.user_id AS user_id, p.body AS body, " +
-		"p.created_at AS created_at, p.mime AS mime, " +
-		"u.account_name AS `user.account_name` " +
+		"p.created_at AS created_at, p.mime AS mime " +
 		"FROM `posts` AS p STRAIGHT_JOIN `users` AS u ON (p.user_id=u.id) " +
 		"WHERE p.user_id = ? AND u.del_flg = 0 " +
 		"ORDER BY p.created_at DESC LIMIT " + strconv.Itoa(postsPerPage)
@@ -632,8 +584,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 	query := "SELECT p.id AS id, p.user_id AS user_id, p.body AS body, " +
-		"p.created_at AS created_at, p.mime AS mime, " +
-		"u.account_name AS `user.account_name` " +
+		"p.created_at AS created_at, p.mime AS mime " +
 		"FROM `posts` AS p STRAIGHT_JOIN `users` AS u ON (p.user_id=u.id) " +
 		"WHERE p.created_at <= ? AND u.del_flg = 0 " +
 		"ORDER BY p.created_at DESC LIMIT " + strconv.Itoa(postsPerPage)
@@ -675,14 +626,7 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	query := "SELECT p.id AS id, p.user_id AS user_id, p.body AS body, " +
-		"p.created_at AS created_at, p.mime AS mime, " +
-		"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, " +
-		"u.authority AS `user.authority`, u.del_flg AS `user.del_flg` " +
-		"FROM `posts` AS p JOIN `users` AS u ON (p.user_id=u.id) " +
-		"WHERE p.id = ? AND u.del_flg = 0 " +
-		"ORDER BY p.created_at DESC LIMIT " + strconv.Itoa(postsPerPage)
-	err = db.Select(&results, query, pid)
+	err = db.Select(&results, "SELECT * FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
 		return
@@ -779,7 +723,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		query,
 		me.ID,
 		mime,
-		"", //　ローカルファイルとして保存しnginxから配信するのでDBには保存しない
+		"",
 		r.FormValue("body"),
 	)
 	if err != nil {
@@ -828,20 +772,11 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 			log.Print(err)
 			return
 		}
-		return
-	}
-
-	imgFile := imageDir + fmt.Sprintf("/%d.%s", post.ID, ext)
-	f, err := os.Open(imgFile)
-	defer f.Close()
-	if err != nil {
-		log.Print(err)
-		return
-	}
-	_, err = f.Write(post.Imgdata)
-	if err != nil {
-		log.Print(err)
-		return
+		imgFile := imageDir + fmt.Sprintf("/%d.%s", pid, ext)
+		err = os.WriteFile(imgFile, post.Imgdata, 0644)
+		if err != nil {
+			log.Print(err)
+		}
 	}
 
 	w.WriteHeader(http.StatusNotFound)
@@ -864,6 +799,10 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 		log.Print("post_idは整数のみです")
 		return
 	}
+
+	mc.Delete("comments." + strconv.Itoa(postID) + ".count")
+	mc.Delete("comments." + strconv.Itoa(postID) + ".true")
+	mc.Delete("comments." + strconv.Itoa(postID) + ".false")
 
 	query := "INSERT INTO `comments` (`post_id`, `user_id`, `comment`) VALUES (?,?,?)"
 	_, err = db.Exec(query, postID, me.ID, r.FormValue("comment"))
