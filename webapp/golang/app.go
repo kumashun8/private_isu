@@ -171,12 +171,6 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 }
 
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
-	// userIDs := make([]int, 0, len(results))
-	// for _, p := range results {
-	// 	userIDs = append(userIDs, p.UserID)
-	// }
-	// users := preloeadUsers(userIDs)
-
 	var posts []Post
 
 	cacheKeys := make([]string, 0, len(results)*2)
@@ -195,7 +189,8 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 		key := fmt.Sprintf("comments.%d.count", p.ID)
 		if cachedValues[key] == nil {
 			// キャッシュが存在しない場合はデータベースから取得する
-			err := db.Get(&p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+			query := "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?"
+			err := db.Get(&p.CommentCount, query, p.ID)
 			if err != nil {
 				return nil, err
 			}
@@ -213,10 +208,7 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 		key = fmt.Sprintf("comments.%d.%t", p.ID, allComments)
 		if cachedValues[key] == nil {
 			// キャッシュが存在しない場合はデータベースから取得する
-			query := "SELECT c.`comment` AS `comment`, c.`created_at` AS `created_at`, " +
-				"u.`account_name` AS `user.account_name`" +
-				"FROM `comments` AS c JOIN `users` AS u ON c.`user_id`=u.`id` " +
-				"WHERE c.`post_id` = ? ORDER BY c.`created_at` DESC"
+			query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
 			if !allComments {
 				query += " LIMIT 3"
 			}
@@ -233,6 +225,10 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 			if err != nil {
 				return nil, err
 			}
+			// reverse
+			for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
+				comments[i], comments[j] = comments[j], comments[i]
+			}
 		} else {
 			// キャッシュが存在する場合はキャッシュから取得する
 			err := json.Unmarshal(cachedValues[key].Value, &comments)
@@ -241,18 +237,6 @@ func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, erro
 			}
 			p.Comments = comments
 		}
-
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
-		}
-
-		p.Comments = comments
-
-		// キャッシュから取得
-		// p.User = getUser(p.UserID)
-		// プリロードから取得
-		// p.User = users[p.UserID]
 
 		p.CSRFToken = csrfToken
 
@@ -779,7 +763,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		query,
 		me.ID,
 		mime,
-		"", //　ローカルファイルとして保存しnginxから配信するのでDBには保存しない
+		filedata,
 		r.FormValue("body"),
 	)
 	if err != nil {
