@@ -628,14 +628,7 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-
-	query := "SELECT p.id AS id, p.user_id AS user_id, p.body AS body, " +
-		"p.created_at AS created_at, p.mime AS mime, " +
-		"u.id AS `user.id`, u.account_name AS `user.account_name`, u.passhash AS `user.passhash`, " +
-		"u.authority AS `user.authority`, u.del_flg AS `user.del_flg` " +
-		"FROM `posts` AS p JOIN `users` AS u ON (p.user_id=u.id) " +
-		"WHERE p.id = ? AND u.del_flg = 0 " +
-		"ORDER BY p.created_at DESC LIMIT " + strconv.Itoa(postsPerPage)
+	err = db.Select(&results, "SELECT * FROM `posts` WHERE `id` = ?", pid)
 	err = db.Select(&results, query, pid)
 	if err != nil {
 		log.Print(err)
